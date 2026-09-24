@@ -2,6 +2,8 @@
 from datetime import datetime, timezone
 from contextlib import contextmanager
 import json
+import hashlib
+import shutil
 import sqlite3
 import uuid
 
@@ -13,6 +15,7 @@ DATA_DIRECTORY = ROOT / "data"
 DATABASE_PATH = DATA_DIRECTORY / "sistema.sqlite3"
 LEGACY_DATABASE_PATH = PROJECT_ROOT / "data" / "people.sqlite3"
 EVIDENCE_DIRECTORY = DATA_DIRECTORY / "evidence"
+ENROLLMENT_DIRECTORY = DATA_DIRECTORY / "enrollments"
 DEFAULT_REQUIREMENTS = ("casco", "chaleco", "guantes")
 
 
@@ -35,6 +38,7 @@ def connect():
 def initialize_database():
     DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
     EVIDENCE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    ENROLLMENT_DIRECTORY.mkdir(parents=True, exist_ok=True)
     if not DATABASE_PATH.exists() and LEGACY_DATABASE_PATH.exists():
         # SQLite backup also includes committed pages that may still be in WAL.
         source = sqlite3.connect(LEGACY_DATABASE_PATH)
@@ -100,7 +104,28 @@ def delete_person(name):
     with connect() as database:
         cursor = database.execute("DELETE FROM templates WHERE name=?", (name,))
         database.execute("DELETE FROM people WHERE name=?", (name,))
-        return cursor.rowcount
+        deleted=cursor.rowcount
+    folder=enrollment_folder(name)
+    if folder.exists():shutil.rmtree(folder)
+    return deleted
+
+
+def enrollment_folder(name):
+    return ENROLLMENT_DIRECTORY / hashlib.sha256(name.strip().casefold().encode("utf-8")).hexdigest()[:24]
+
+
+def save_enrollment_images(name, images):
+    folder=enrollment_folder(name);temporary=folder.with_name(folder.name+".tmp")
+    if temporary.exists():shutil.rmtree(temporary)
+    temporary.mkdir(parents=True,exist_ok=True)
+    for index,image in enumerate(images[:8],1):cv2.imwrite(str(temporary/f"{index:02d}.jpg"),image,[cv2.IMWRITE_JPEG_QUALITY,90])
+    if folder.exists():shutil.rmtree(folder)
+    temporary.replace(folder)
+
+
+def list_enrollment_images(name):
+    folder=enrollment_folder(name)
+    return sorted(folder.glob("*.jpg")) if folder.exists() else []
 
 
 def get_required_epp():
@@ -152,7 +177,7 @@ def record_event(event_type, status, frame=None, person_name=None, decisions=Non
         return cursor.lastrowid
 
 
-def query_events(person="", event_type="Todos", status="Todos", date_from="", date_to="", limit=500):
+def query_events(person="", event_type="Todos", status="Todos", date_from="", date_to="", limit=500, offset=0):
     clauses, parameters = [], []
     for value, clause in ((person.strip(), "person_name LIKE ?"),):
         if value:
@@ -165,16 +190,17 @@ def query_events(person="", event_type="Todos", status="Todos", date_from="", da
         clauses.append("status=?")
         parameters.append(status)
     if date_from.strip():
-        clauses.append("date(timestamp) >= date(?)")
+        clauses.append("date(timestamp, 'localtime') >= date(?)")
         parameters.append(date_from.strip())
     if date_to.strip():
-        clauses.append("date(timestamp) <= date(?)")
+        clauses.append("date(timestamp, 'localtime') <= date(?)")
         parameters.append(date_to.strip())
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(int(limit))
+    parameters.append(max(0, int(offset)))
     with connect() as database:
         return database.execute(
-            "SELECT * FROM events" + where + " ORDER BY timestamp DESC LIMIT ?", parameters
+            "SELECT * FROM events" + where + " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?", parameters
         ).fetchall()
 
 

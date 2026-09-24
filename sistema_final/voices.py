@@ -1,6 +1,7 @@
 """Asistente de voz local para resultados confirmados del sistema."""
 import queue
 import threading
+import time
 
 import pyttsx3
 
@@ -12,7 +13,7 @@ def epp_message(status, decisions, required):
     required = [name for name in required if name in decisions]
     missing = [LABELS.get(name, name) for name in required if decisions[name] == "no"]
     if status == "COMPLETO":
-        return "Acceso autorizado. Equipo de protección personal completo. Puede continuar."
+        return "Equipo de protección personal completo. Verificación finalizada."
     if missing and len(missing) == len(required):
         return "Atención. Persona detectada sin equipo de protección personal. Por favor, equípese antes de continuar."
     if missing:
@@ -38,7 +39,7 @@ class VoiceAssistant(threading.Thread):
             return
         message = epp_message(status, decisions, required)
         try:
-            self.messages.put_nowait(message)
+            self.messages.put_nowait((time.monotonic(), message))
         except queue.Full:
             # Una alerta antigua pierde valor; se conserva la que ya está sonando.
             try:
@@ -46,13 +47,11 @@ class VoiceAssistant(threading.Thread):
             except queue.Empty:
                 pass
             try:
-                self.messages.put_nowait(message)
+                self.messages.put_nowait((time.monotonic(), message))
             except queue.Full:
                 pass
 
     def run(self):
-        if not self.enabled:
-            return
         engine = None
         try:
             engine = pyttsx3.init()
@@ -66,8 +65,10 @@ class VoiceAssistant(threading.Thread):
             self.status = "Sabina lista"
             while not self.stop.is_set():
                 try:
-                    message = self.messages.get(timeout=0.1)
+                    created, message = self.messages.get(timeout=0.1)
                 except queue.Empty:
+                    continue
+                if not self.enabled or time.monotonic() - created > 2.0:
                     continue
                 self.status = "Hablando"
                 engine.say(message)

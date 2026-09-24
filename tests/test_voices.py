@@ -7,7 +7,8 @@ class VoiceMessageTests(unittest.TestCase):
     def test_complete_message(self):
         text = epp_message("COMPLETO", {"casco": "si", "chaleco": "si"}, ("casco", "chaleco"))
         self.assertIn("completo", text)
-        self.assertIn("Puede continuar", text)
+        self.assertIn("Verificación finalizada", text)
+        self.assertNotIn("Acceso autorizado", text)
 
     def test_partial_message_lists_missing_items(self):
         text = epp_message("INCOMPLETO", {"casco": "si", "chaleco": "no", "guantes": "no"},

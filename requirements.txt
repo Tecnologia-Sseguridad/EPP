@@ -5,4 +5,5 @@ ultralytics==8.4.157
 lap==0.5.13
 onnxruntime==1.23.2
 pyttsx3==2.99
+PyQt6==6.10.2
 mrzscanner_docsaid @ git+https://github.com/DocsaidLab/MRZScanner.git@7f98880115441c8e42424eda1dc8f1abd4e39377

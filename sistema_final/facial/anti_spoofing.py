@@ -79,13 +79,17 @@ class LivenessDecision:
         self.scores.clear()
 
     def update(self, real_score):
+        if not np.isfinite(real_score) or not 0 <= real_score <= 1:
+            self.reset()
+            return "inconcluso", 0.0
         self.scores.append(float(real_score))
         average = float(np.mean(self.scores))
         if len(self.scores) < self.minimum_samples:
             return "verificando", average
         real_votes = sum(score >= self.real_threshold for score in self.scores)
         fake_votes = sum(score <= self.fake_threshold for score in self.scores)
-        if real_votes >= 4 and average >= self.real_threshold:
+        # A historical majority must not approve a currently suspicious frame.
+        if real_votes >= 4 and average >= self.real_threshold and real_score >= self.real_threshold:
             return "real", average
         if fake_votes >= 3 and average <= self.fake_threshold:
             return "falso", average

@@ -2,7 +2,6 @@ import argparse
 from pathlib import Path
 import sys
 import threading
-import tkinter as tk
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,7 +14,7 @@ from sistema_final.core.configuration import load_config
 from sistema_final.core.database import get_required_epp, initialize_database
 from sistema_final.epp.service import EppService
 from sistema_final.facial.service import FacialService
-from sistema_final.ui.main_window import MainWindow
+from sistema_final.ui.qt_workspace import run_qt
 from sistema_final.voices import VoiceAssistant
 
 
@@ -41,15 +40,12 @@ def main():
         required=get_required_epp(),
     )
     voice = VoiceAssistant(stop)
+    voice.enabled = config.get("voice_enabled", True)
     camera.start()
     facial.start()
     epp.start()
     voice.start()
-    root = tk.Tk()
-    app = MainWindow(root, camera, facial, epp, stop, config, voice)
-    if arguments.smoke_test:
-        root.after(5000, app.close)
-    root.mainloop()
+    run_qt(camera, facial, epp, stop, config, voice, arguments.smoke_test)
     stop.set()
     facial.join(timeout=2)
     epp.join(timeout=2)

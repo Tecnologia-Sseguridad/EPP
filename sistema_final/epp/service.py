@@ -1,4 +1,3 @@
-from collections import deque
 from dataclasses import dataclass, field
 import threading
 import time
@@ -7,10 +6,12 @@ import cv2
 import numpy as np
 
 from engine import Latest
+from .temporal import Evidence, overall_status
 from sistema_final.core.configuration import PROJECT_ROOT
 
 
 REQUIRED = ("casco", "chaleco", "guantes")
+NEGATIVE_MIN_CONFIDENCE = 0.40
 RULES = {
     "casco": {"positive": "helmet", "negative": "no_helmet", "zone": "head"},
     "chaleco": {"positive": "vest", "negative": "none", "zone": "torso"},
@@ -27,11 +28,10 @@ class Person:
     display_id: int
     raw_box: list | None = None
     hits: int = 1
-    absent: int = 0
-    evidence: dict = field(default_factory=lambda: {name: deque(maxlen=15) for name in RULES})
     visible: dict = field(default_factory=lambda: {name: False for name in RULES})
-    state: dict = field(default_factory=lambda: {name: "verificando" for name in RULES})
-    last_explicit: dict = field(default_factory=lambda: {name: 0.0 for name in RULES})
+    assessments: dict = field(default_factory=lambda: {name: Evidence() for name in RULES})
+    last_seen: float = 0.0
+    observations: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.raw_box is None:
@@ -65,7 +65,7 @@ def select_primary_person(detections, frame_shape):
     frame_area = max(1.0, frame_height * frame_width)
     candidates = []
     for detection in detections:
-        if detection["name"] != "Person" or detection["track_id"] is None:
+        if detection["name"] != "Person":
             continue
         x1, y1, x2, y2 = detection["box"]
         box_width, box_height = x2 - x1, y2 - y1
@@ -94,6 +94,21 @@ def relative_zone(epp_box, person_box):
     return (center_x - x1) / max(1.0, x2 - x1), (center_y - y1) / max(1.0, y2 - y1)
 
 
+def expanded_box(person_box, zone):
+    """Amplía solo la zona lógica; no altera el seguimiento de la persona."""
+    x1, y1, x2, y2 = person_box
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    if zone == "head":
+        return [x1 - width * 0.18, y1 - height * 0.30,
+                x2 + width * 0.18, y2]
+    if zone == "hands":
+        return [x1 - width * 0.32, y1 - height * 0.04,
+                x2 + width * 0.32, y2 + height * 0.06]
+    return [x1 - width * 0.10, y1 - height * 0.04,
+            x2 + width * 0.10, y2 + height * 0.06]
+
+
 def compatible(epp_box, person_box, zone):
     relative_x, relative_y = relative_zone(epp_box, person_box)
     # El detector de persona puede comenzar bajo el casco o recortar levemente
@@ -120,7 +135,9 @@ def assign_to_people(epp_detections, people):
             person_box = person.raw_box or person.box
             if not compatible(detection["box"], person_box, zone):
                 continue
-            coverage = intersection(detection["box"], person_box) / area(detection["box"])
+            # Casco y manos suelen sobresalir de la caja que YOLO entrega para
+            # Person. La cobertura se calcula contra una zona lógica ampliada.
+            coverage = intersection(detection["box"], expanded_box(person_box, zone)) / area(detection["box"])
             relative_x, relative_y = relative_zone(detection["box"], person_box)
             distance = ((relative_x - 0.5) ** 2 + (relative_y - 0.45) ** 2) ** 0.5
             score = coverage - 0.20 * distance
@@ -137,13 +154,15 @@ def framing_status(box, shape):
     x1, y1, x2, y2 = box
     person_height = y2 - y1
     person_width = x2 - x1
-    if person_height < height * 0.48:
+    # A esta escala el modelo todavía conserva detalle suficiente. El límite
+    # anterior (48 %) obligaba innecesariamente a mostrar casi todo el cuerpo.
+    if person_height < height * 0.38:
         return "acercate"
     # Para acreditar casco, torso y guantes necesitamos margen alrededor del
     # cuerpo. Una persona que llena la cámara debe alejarse.
-    if (person_height > height * 0.94 or person_width > width * 0.82
-            or x1 <= 8 or x2 >= width - 8 or y1 <= 5
-            or y1 + person_height * 0.90 >= height - 8):
+    if (person_height > height * 0.985 or person_width > width * 0.90
+            or x1 <= 3 or x2 >= width - 3 or y1 <= 2
+            or y1 + person_height * 0.97 >= height - 3):
         return "alejate"
     return "correcto"
 
@@ -161,57 +180,44 @@ def zone_visible(box, zone, shape):
     return y2 < height - 4
 
 
-def add_evidence(person, detections, shape):
+def distinct_pair(detections):
+    """Two distinct boxes; one glove moving across the torso is never a pair."""
+    for index, first in enumerate(detections):
+        for second in detections[index + 1:]:
+            overlap = intersection(first["box"], second["box"])
+            if overlap / min(area(first["box"]), area(second["box"])) < 0.15:
+                return True
+    return False
+
+
+def add_evidence(person, detections, shape, now=None):
+    now = time.perf_counter() if now is None else now
     for element, rule in RULES.items():
-        positive = detections.get(rule["positive"], [])
-        negative = detections.get(rule["negative"], [])
+        positive = [item for item in detections.get(rule["positive"], [])
+                    if item["confidence"] >= 0.35]
+        negative = [item for item in detections.get(rule["negative"], [])
+                    if item["confidence"] >= NEGATIVE_MIN_CONFIDENCE]
         person.visible[element] = bool(positive or negative) or zone_visible(
-            person.raw_box or person.box, rule["zone"], shape
-        )
-        if not person.visible[element]:
-            person.evidence[element].append(None)
-            continue
-        # El modelo entrega una caja por guante. Una sola mano detectada no
-        # acredita que la persona lleve ambos guantes.
-        if element == "guantes" and len(positive) < 2:
-            positive = []
-        if positive and negative:
-            positive_confidence = max(item["confidence"] for item in positive)
-            negative_confidence = max(item["confidence"] for item in negative)
-            positive, negative = (positive, []) if positive_confidence >= negative_confidence else ([], negative)
-        value = 1 if positive else -1 if negative else 0
-        person.evidence[element].append(value)
-        if value:
-            person.last_explicit[element] = time.perf_counter()
+            person.raw_box or person.box, rule["zone"], shape)
+        if element == "guantes":
+            # A bare hand contradicts compliance even with a glove on the other.
+            value = -1 if negative else 1 if distinct_pair(positive) else 0
+        elif positive and negative:
+            value = None  # Conflicting observations cannot establish compliance.
+        else:
+            value = 1 if positive else -1 if negative else 0
+        person.assessments[element].observe(value, now)
+        person.observations[element] = {
+            "positive": len(positive), "negative": len(negative),
+            "confidence": max([d["confidence"] for d in positive + negative], default=0),
+        }
 
 
-def decide(person, element):
-    previous = person.state[element]
-    if not person.visible[element]:
-        if previous in {"si", "no"} and time.perf_counter() - person.last_explicit[element] <= 2.0:
-            return previous
-        return "no visible"
-    values = [value for value in person.evidence[element] if value is not None]
-    if not values:
-        return "verificando"
-    # Se conserva una conclusión ante pérdidas breves, no indefinidamente. Si
-    # pasan dos segundos sin evidencia explícita, vuelve a ANALIZANDO.
-    if (values[-1] == 0 and previous in {"si", "no"}
-            and time.perf_counter() - person.last_explicit[element] > 2.0):
-        person.state[element] = "verificando"
-        return "verificando"
-    # Cero significa "el modelo no concluyó", nunca "no lo lleva".
-    explicit = [value for value in values[-8:] if value != 0]
-    if not explicit:
-        return previous
-    positives = sum(value == 1 for value in explicit)
-    negatives = sum(value == -1 for value in explicit)
-    required = 3 if previous in {"si", "no"} else 2
-    if positives >= required and positives / len(explicit) >= 0.67:
-        person.state[element] = "si"
-    elif negatives >= required and negatives / len(explicit) >= 0.67:
-        person.state[element] = "no"
-    return person.state[element]
+def decide(person, element, now=None):
+    now = time.perf_counter() if now is None else now
+    state = person.assessments[element].decision(now)
+    return state if state in {"si", "no"} else (
+        "verificando" if person.visible[element] else "no visible")
 
 
 def reconnect_distance(new_box, person):
@@ -219,137 +225,56 @@ def reconnect_distance(new_box, person):
     old_x, old_y = (person.box[0] + person.box[2]) / 2, (person.box[1] + person.box[3]) / 2
     diagonal = max(1.0, ((person.box[2] - person.box[0]) ** 2 + (person.box[3] - person.box[1]) ** 2) ** 0.5)
     area_ratio = area(new_box) / area(person.box)
-    if not 0.35 <= area_ratio <= 2.85:
+    # El casco, los brazos y una inclinación pueden cambiar mucho la caja de
+    # Person sin que haya cambiado el sujeto.
+    if not 0.18 <= area_ratio <= 5.5:
         return None
     return ((new_x - old_x) ** 2 + (new_y - old_y) ** 2) ** 0.5 / diagonal
 
 
-def _draw_equipment_icon(frame, center, element, color, state, size=38):
-    """Dibuja una insignia compacta e independiente de fuentes Unicode."""
-    cx, cy = center
-    half = size // 2
-    left, top = cx - half, cy - half
-    right, bottom = cx + half, cy + half
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (left, top), (right, bottom), color, -1, cv2.LINE_AA)
-    cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
-    cv2.rectangle(frame, (left, top), (right, bottom), (245, 245, 245), 1, cv2.LINE_AA)
-
-    white = (250, 250, 250)
-    if element == "casco":
-        cv2.ellipse(frame, (cx, cy + 1), (10, 9), 180, 0, 180, white, 2, cv2.LINE_AA)
-        cv2.line(frame, (cx - 13, cy + 2), (cx + 13, cy + 2), white, 2, cv2.LINE_AA)
-        cv2.line(frame, (cx, cy - 8), (cx, cy - 1), white, 1, cv2.LINE_AA)
-    elif element == "chaleco":
-        points = np.array([
-            [cx - 10, cy - 11], [cx - 3, cy - 7], [cx + 3, cy - 7],
-            [cx + 10, cy - 11], [cx + 12, cy + 11], [cx - 12, cy + 11],
-        ], dtype=np.int32)
-        cv2.polylines(frame, [points], True, white, 2, cv2.LINE_AA)
-        cv2.line(frame, (cx, cy - 6), (cx, cy + 11), white, 1, cv2.LINE_AA)
-    else:  # guantes
-        points = np.array([
-            [cx - 8, cy + 10], [cx - 10, cy - 2], [cx - 7, cy - 8],
-            [cx - 4, cy - 1], [cx - 2, cy - 10], [cx + 1, cy - 1],
-            [cx + 4, cy - 9], [cx + 6, cy + 1], [cx + 11, cy - 2],
-            [cx + 10, cy + 7], [cx + 5, cy + 12],
-        ], dtype=np.int32)
-        cv2.polylines(frame, [points], True, white, 2, cv2.LINE_AA)
-
-    if state == "no":
-        cv2.line(frame, (left + 5, bottom - 5), (right - 5, top + 5), white, 2, cv2.LINE_AA)
-    elif state == "verificando":
-        cv2.circle(frame, (right - 7, bottom - 7), 3, white, -1, cv2.LINE_AA)
-    elif state == "no visible":
-        cv2.putText(frame, "?", (right - 13, bottom - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48, white, 1, cv2.LINE_AA)
-
-
 def draw_person(frame, person, required=REQUIRED):
-    x1, y1, x2, y2 = [int(round(value)) for value in person.box]
+    # Unobtrusive monochrome outline; results belong outside the image.
+    x1, y1, x2, y2 = person.box
+    w, h = x2 - x1, y2 - y1
     height, width = frame.shape[:2]
-    x1, x2 = max(0, x1), min(width - 1, x2)
-    y1, y2 = max(0, y1), min(height - 1, y2)
-    framing = framing_status(person.raw_box or person.box, frame.shape)
-    if framing != "correcto":
-        decisions = {element: "fuera de encuadre" for element in required}
-        overall = "ALEJATE" if framing == "alejate" else "ACERCATE"
-    else:
-        decisions = {element: decide(person, element) for element in required}
-        states = list(decisions.values())
-        overall = "INCOMPLETO" if "no" in states else "COMPLETO" if all(state == "si" for state in states) else "VERIFICANDO"
-    general_color = (65, 205, 85) if overall == "COMPLETO" else (45, 45, 235) if overall == "INCOMPLETO" else (40, 190, 255)
-    state_colors = {
-        "si": (65, 205, 85),
-        "no": (45, 45, 235),
-        "verificando": (40, 190, 255),
-        "no visible": (150, 150, 150),
-        "fuera de encuadre": (150, 150, 150),
-    }
-    cv2.rectangle(frame, (x1, y1), (x2, y2), general_color, 2, cv2.LINE_AA)
+    p1 = (max(0, round(x1 - w * .06)), max(0, round(y1 - h * .10)))
+    p2 = (min(width - 1, round(x2 + w * .06)), min(height - 1, round(y2)))
+    cv2.rectangle(frame, p1, p2, (25, 25, 25), 3, cv2.LINE_AA)
+    cv2.rectangle(frame, p1, p2, (235, 235, 235), 1, cv2.LINE_AA)
+    decisions = {name: decide(person, name) for name in required}
+    return decisions, overall_status(decisions)
 
-    # Tarjeta textual adaptable. Los pictogramas vectoriales son una guía
-    # secundaria; el texto siempre comunica el resultado explícitamente.
-    panel_width = 218
-    header_height, row_height = 31, 29
-    panel_height = header_height + len(required) * row_height + 7
-    if width - x2 >= panel_width + 10:
-        panel_x = x2 + 8
-        panel_y = y1
-    elif x1 >= panel_width + 10:
-        panel_x = x1 - panel_width - 8
-        panel_y = y1
-    else:
-        # Cuando la persona llena la imagen se usa una esquina, sin perseguir
-        # el movimiento del cuerpo; esto reduce saltos visuales.
-        panel_x = width - panel_width - 8
-        panel_y = 8
-    panel_x = min(max(6, panel_x), max(6, width - panel_width - 6))
-    panel_y = min(max(6, panel_y), max(6, height - panel_height - 6))
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (panel_x, panel_y),
-                  (panel_x + panel_width, panel_y + panel_height), (16, 18, 21), -1)
-    cv2.addWeighted(overlay, 0.86, frame, 0.14, 0, frame)
-    cv2.rectangle(frame, (panel_x, panel_y),
-                  (panel_x + panel_width, panel_y + panel_height), (95, 99, 105), 1, cv2.LINE_AA)
-    cv2.rectangle(frame, (panel_x, panel_y),
-                  (panel_x + 4, panel_y + panel_height), general_color, -1)
-    cv2.putText(frame, f"EPP  {overall}", (panel_x + 14, panel_y + 21),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.50, general_color, 1, cv2.LINE_AA)
 
-    display_states = {
-        "si": "CUMPLE",
-        "no": "FALTA",
-        "verificando": "ANALIZANDO",
-        "no visible": "NO VISIBLE",
-        "fuera de encuadre": "ENCUADRA",
-    }
-    display_names = {
-        "casco": "CASCO",
-        "chaleco": "CHALECO",
-        "guantes": "GUANTES",
-        "antiparras": "ANTIPARRAS",
-        "botas": "BOTAS",
-    }
-    for index, element in enumerate(required):
-        state = decisions[element]
-        row_y = panel_y + header_height + index * row_height
-        if index:
-            cv2.line(frame, (panel_x + 13, row_y), (panel_x + panel_width - 10, row_y),
-                     (58, 61, 66), 1, cv2.LINE_AA)
-        _draw_equipment_icon(
-            frame, (panel_x + 25, row_y + row_height // 2), element,
-            state_colors[state], state, size=20
-        )
-        cv2.putText(frame, display_names.get(element, element.upper()),
-                    (panel_x + 42, row_y + 19), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.39, (226, 229, 232), 1, cv2.LINE_AA)
-        status_text = display_states[state]
-        text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)[0]
-        cv2.putText(frame, status_text,
-                    (panel_x + panel_width - text_size[0] - 10, row_y + 19),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, state_colors[state], 1, cv2.LINE_AA)
-    return decisions, overall
+class Presence:
+    """Single-person spatial continuity; not an identity recognition mechanism."""
+    def __init__(self):
+        self.person = None
+        self.next_id = 1
+
+    def reset(self):
+        self.person = None
+
+    def update(self, detection, now):
+        previous = self.person
+        if detection is None:
+            if previous and now - previous.last_seen > .65:
+                self.reset()
+            return None
+        keep = False
+        if previous and now - previous.last_seen <= .65:
+            box = detection["box"]
+            distance = reconnect_distance(box, previous)
+            overlap = intersection(box, previous.raw_box) / max(1, min(area(box), area(previous.raw_box)))
+            keep = distance is not None and distance < .30 and overlap > .30
+        if not keep:
+            self.person = Person(list(detection["box"]), detection["confidence"], self.next_id)
+            self.next_id += 1
+        person = self.person
+        person.raw_box = list(detection["box"])
+        person.box = [old * .65 + new * .35 for old, new in zip(person.box, person.raw_box)]
+        person.hits += 1
+        person.last_seen = now
+        return person
 
 
 class EppService(threading.Thread):
@@ -361,93 +286,90 @@ class EppService(threading.Thread):
         self.enabled = threading.Event()
         self.latest = Latest()
         self.status = "En espera"
+        self.reset_requested = threading.Event()
 
     def activate(self):
         self.enabled.set()
 
     def deactivate(self):
         self.enabled.clear()
+        self.latest.put(None)
+        self.reset_requested.set()
 
     def set_required(self, required):
         self.required = tuple(required)
+        self.latest.put(None)
+        self.reset_requested.set()
 
     def run(self):
         model = None
-        people = {}
-        next_person = 1
+        presence = Presence()
         sequence = -1
         try:
             while not self.stop.is_set():
+                if self.reset_requested.is_set():
+                    presence.reset()
+                    self.reset_requested.clear()
                 if not self.enabled.is_set():
-                    people.clear()
-                    sequence = -1
-                    self.stop.wait(0.05)
+                    presence.reset()
+                    self.latest.put(None)
+                    self.stop.wait(.05)
                     continue
                 if model is None:
-                    self.status = "Cargando modelo EPP..."
+                    self.status = "Cargando detector..."
                     from ultralytics import YOLO
                     model = YOLO(str(PROJECT_ROOT / "models" / "ppe_yolo26n.pt"))
                     self.status = "Listo"
                 frame = self.camera.latest.get()
-                if frame is None or frame.sequence == sequence or time.perf_counter() - frame.captured > 0.5:
-                    self.stop.wait(0.015)
+                if frame is None or frame.sequence == sequence or time.perf_counter() - frame.captured > .5:
+                    self.stop.wait(.015)
                     continue
                 sequence = frame.sequence
                 start = time.perf_counter()
-                result = model.track(frame.image, persist=True, tracker="bytetrack.yaml", conf=self.confidence, iou=self.iou, verbose=False)[0]
+                # Equipment predictions must not wait for tracking confirmation.
+                result = model.predict(frame.image, imgsz=640, conf=self.confidence,
+                                       iou=self.iou, verbose=False)[0]
                 detections = []
                 if result.boxes is not None:
-                    boxes = result.boxes.xyxy.cpu().tolist()
-                    confidences = result.boxes.conf.cpu().tolist()
-                    classes = result.boxes.cls.int().cpu().tolist()
-                    ids = result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [None] * len(boxes)
-                    for box, confidence, class_id, track_id in zip(boxes, confidences, classes, ids):
-                        detections.append({"box": box, "confidence": float(confidence), "name": model.names[class_id], "track_id": track_id})
+                    for box, confidence, class_id in zip(
+                            result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist(),
+                            result.boxes.cls.int().cpu().tolist()):
+                        detections.append({"box": box, "confidence": float(confidence),
+                                           "name": model.names[class_id], "track_id": None})
                 detections = remove_duplicates(detections)
-                primary_detection = select_primary_person(detections, frame.image.shape)
-                for person in people.values():
-                    person.absent += 1
-                for detection in ([primary_detection] if primary_detection is not None else []):
-                    track_id = detection["track_id"]
-                    person = people.get(track_id)
-                    if person is None:
-                        candidates = []
-                        for old_id, lost in people.items():
-                            if 0 < lost.absent <= 3:
-                                distance = reconnect_distance(detection["box"], lost)
-                                if distance is not None and distance <= 0.65:
-                                    candidates.append((distance, old_id, lost))
-                        if candidates:
-                            _, old_id, person = min(candidates, key=lambda item: item[0])
-                            del people[old_id]
-                            people[track_id] = person
-                        else:
-                            person = Person(detection["box"], detection["confidence"], next_person)
-                            next_person += 1
-                            people[track_id] = person
-                    # La caja instantánea decide asociación y encuadre. La caja
-                    # suavizada se usa únicamente para que el dibujo no tiemble.
-                    person.raw_box = list(detection["box"])
-                    # Mayor amortiguación visual: reduce el temblor sin generar demasiado retraso.
-                    person.box = [old * 0.74 + new * 0.26 for old, new in zip(person.box, detection["box"])]
-                    person.hits = min(100, person.hits + 1)
-                    person.absent = 0
-                people = {track_id: person for track_id, person in people.items() if person.absent <= 12}
-                active = {track_id: person for track_id, person in people.items() if person.absent == 0}
-                assigned = assign_to_people([item for item in detections if item["name"] != "Person"], active)
+                primary = select_primary_person(detections, frame.image.shape)
+                others = [item for item in detections if item["name"] == "Person"
+                          and primary is not None and item is not primary
+                          and area(item["box"]) > .55 * area(primary["box"])]
+                ambiguous = bool(others)
+                if ambiguous:
+                    presence.reset()
+                person = presence.update(None if ambiguous else primary, frame.captured)
                 preview = frame.image.copy()
                 summaries = []
-                for track_id, person in people.items():
-                    if person.absent == 0:
-                        if framing_status(person.raw_box or person.box, frame.image.shape) == "correcto":
-                            add_evidence(person, assigned.get(track_id, {}), frame.image.shape)
-                    if person.hits >= 2 and person.absent <= 5:
-                        decisions, overall = draw_person(preview, person, self.required)
-                        summaries.append({"id": person.display_id, "decisions": decisions, "overall": overall})
-                annotation_mask = np.any(preview != frame.image, axis=2)
-                self.latest.put({"sequence": sequence, "captured": frame.captured, "preview": preview,
-                                 "annotation_mask": annotation_mask,
-                                 "people": summaries, "inference_ms": (time.perf_counter() - start) * 1000})
+                equipment = []
+                guidance = "Debe aparecer una sola persona" if ambiguous else "Ubíquese frente a la cámara"
+                if person is not None:
+                    assigned = assign_to_people(
+                        [item for item in detections if item["name"] != "Person"], {person.display_id: person})
+                    equipment = [item for items in assigned[person.display_id].values() for item in items]
+                    # Evaluate each item, even when legs touch the image border.
+                    add_evidence(person, assigned[person.display_id], frame.image.shape)
+                    decisions, overall = draw_person(preview, person, self.required)
+                    framing = framing_status(person.raw_box, frame.image.shape)
+                    guidance = ("Acérquese: falta detalle en la imagen" if framing == "acercate"
+                                else "Deje visibles la cabeza, el torso y ambas manos")
+                    if framing == "acercate":
+                        decisions = {name: "verificando" for name in self.required}
+                        overall = "VERIFICANDO"
+                    summaries.append({"id": person.display_id, "decisions": decisions,
+                                      "overall": overall, "observations": person.observations,
+                                      "framing": framing})
+                elapsed = (time.perf_counter() - start) * 1000
+                self.latest.put({"sequence": sequence, "captured": frame.captured,
+                                 "preview": preview, "annotation_mask": np.any(preview != frame.image, axis=2),
+                                 "people": summaries, "equipment": equipment,
+                                 "guidance": guidance, "inference_ms": elapsed})
         except Exception as exc:
             self.status = f"Error EPP: {exc}"
             self.latest.put(None)

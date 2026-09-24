@@ -40,6 +40,7 @@ class SystemDatabaseTests(unittest.TestCase):
                 )
                 rows = database.query_events(person="Ana", event_type="epp", status="INCOMPLETO")
                 self.assertEqual([row["id"] for row in rows], [event_id])
+                self.assertEqual(database.query_events(limit=1, offset=1), [])
                 evidence = root / rows[0]["image_path"]
                 self.assertTrue(evidence.is_file())
                 self.assertEqual(database.delete_events([event_id]), 1)

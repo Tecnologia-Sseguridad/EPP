@@ -24,6 +24,20 @@ class LivenessDecisionTests(unittest.TestCase):
         states = [decision.update(score)[0] for score in (0.40, 0.55, 0.42, 0.52)]
         self.assertEqual(states[-1], "inconcluso")
 
+    def test_real_history_does_not_approve_current_spoof(self):
+        decision = LivenessDecision()
+        for _ in range(7):
+            decision.update(.99)
+        state, _ = decision.update(.05)
+        self.assertNotEqual(state, "real")
+
+    def test_invalid_score_resets_confirmation(self):
+        decision = LivenessDecision()
+        for _ in range(7):
+            decision.update(.99)
+        self.assertEqual(decision.update(float("nan"))[0], "inconcluso")
+        self.assertEqual(decision.update(.99)[0], "verificando")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ import numpy as np
 
 from engine import Latest, StableIdentity, Store, Vision, match
 from sistema_final.core.configuration import PROJECT_ROOT
-from sistema_final.core.database import DATABASE_PATH, sync_people
+from sistema_final.core.database import DATABASE_PATH, save_enrollment_images, sync_people
 from sistema_final.facial.anti_spoofing import AntiSpoofingEngine
 
 
@@ -61,6 +61,8 @@ class FacialService(threading.Thread):
             gallery = store.gallery()
             self.names = sorted(gallery)
             stable = StableIdentity()
+            previous_vector = None
+            previous_capture = 0.0
             session = None
             sequence = -1
             durations = deque(maxlen=300)
@@ -73,7 +75,7 @@ class FacialService(threading.Thread):
                     if liveness_engine:
                         liveness_engine.reset()
                     if action == "enroll":
-                        session = {"name": name, "vectors": [], "started": time.perf_counter()}
+                        session = {"name": name, "vectors": [], "previews": [], "started": time.perf_counter()}
                         self.enrolling = True
                         self.status = f"Registrando {name}: mira al frente y cambia ligeramente el ángulo"
                     elif action == "cancel":
@@ -97,7 +99,10 @@ class FacialService(threading.Thread):
                     self.enrolling = False
                     self.status = "Registro vencido (45 s). No se guardaron muestras parciales."
                 frame = self.camera.latest.get()
-                if frame is None or frame.sequence == sequence or start - frame.captured > 0.3:
+                if frame is not None and frame.sequence == sequence and start - frame.captured <= 0.3:
+                    self.stop.wait(0.015)
+                    continue
+                if frame is None or start - frame.captured > 0.3:
                     stable.reset()
                     if liveness_engine:
                         liveness_engine.reset()
@@ -105,6 +110,15 @@ class FacialService(threading.Thread):
                     continue
                 sequence = frame.sequence
                 faces, vector, quality = vision.analyze(frame.image)
+                # Liveness history belongs to one continuous face observation.
+                if vector is not None and (
+                        previous_vector is None or frame.captured - previous_capture > .5
+                        or float(previous_vector @ vector) < .55):
+                    stable.reset()
+                    if liveness_engine:
+                        liveness_engine.reset()
+                previous_vector = vector.copy() if vector is not None else None
+                previous_capture = frame.captured
                 face_size = min(faces[0][2], faces[0][3]) if vector is not None and len(faces) == 1 else 0.0
                 # Entre 70 y 99 px permitimos reconocer desde más lejos, pero
                 # exigimos mayor similitud y separación para no aumentar las
@@ -125,9 +139,7 @@ class FacialService(threading.Thread):
                     liveness_engine.reset()
                     liveness = "sin rostro"
                 elif vector is not None:
-                    liveness = "real"
-                    liveness_score = 1.0
-                    liveness_raw = 1.0
+                    quality = "Prueba de vida desactivada: no se confirma identidad"
                 identity = (
                     stable.update(candidate, vector, frame.captured)
                     if vector is not None and not session and liveness == "real"
@@ -145,10 +157,12 @@ class FacialService(threading.Thread):
                         quality = "Rostro diferente: cancela y vuelve a registrar"
                     else:
                         samples.append(vector)
+                        session["previews"].append(vision.recognizer.alignCrop(frame.image, faces[0]).copy())
                         last_sample = start
                         self.status = f"Registrando {session['name']}: {len(samples)}/8 muestras"
                         if len(samples) == 8:
                             store.save(session["name"], samples)
+                            save_enrollment_images(session["name"],session["previews"])
                             gallery = store.gallery()
                             self.names = sorted(gallery)
                             sync_people()
@@ -158,11 +172,11 @@ class FacialService(threading.Thread):
                 elapsed = (time.perf_counter() - start) * 1000
                 durations.append(elapsed)
                 preview = frame.image.copy()
-                color = ((45, 45, 235) if liveness == "falso" else
-                         (60, 200, 100) if identity else (0, 190, 255))
+                color = (235, 235, 235)
                 for face in faces:
                     x, y, width, height = map(int, face[:4])
-                    cv2.rectangle(preview, (x, y), (x + width, y + height), color, 2)
+                    cv2.rectangle(preview, (x, y), (x + width, y + height), (25, 25, 25), 3)
+                    cv2.rectangle(preview, (x, y), (x + width, y + height), color, 1)
                 annotation_mask = np.any(preview != frame.image, axis=2)
                 self.latest.put({
                     "sequence": sequence, "captured": frame.captured, "preview": preview,
