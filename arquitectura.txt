@@ -1,0 +1,171 @@
+La estructura profesional podría ser:
+Detector Facial/
+├── app.py                    ← prototipo facial original
+├── engine.py
+├── probar_epp.py             ← prototipo EPP original
+├── data/
+├── models/
+│
+└── sistema_final/
+    ├── iniciar.bat
+    ├── main.py
+    ├── config.json
+    │
+    ├── core/
+    │   ├── camera.py
+    │   ├── database.py
+    │   ├── events.py
+    │   └── configuration.py
+    │
+    ├── facial/
+    │   ├── detector.py
+    │   ├── recognizer.py
+    │   ├── enrollment.py
+    │   └── matching.py
+    │
+    ├── epp/
+    │   ├── detector.py
+    │   ├── tracker.py
+    │   ├── association.py
+    │   └── decisions.py
+    │
+    ├── fusion/
+    │   └── person_state.py
+    │
+    ├── ui/
+    │   ├── main_window.py
+    │   ├── dashboard.py
+    │   ├── administration.py
+    │   ├── facial_view.py
+    │   └── epp_view.py
+    │
+    ├── models/
+    │   ├── yunet.onnx
+    │   ├── sface.onnx
+    │   └── ppe_yolo26n.pt
+    │
+    ├── data/
+    │   └── sistema.sqlite3
+    │
+    ├── backups/
+    ├── logs/
+    └── tests/
+Menú principal
+Al iniciar aparecería un panel moderno con tres modos:
+Administración
+- Enrolar una persona.
+- Reemplazar su registro facial.
+- Listar personas registradas.
+- Eliminar registros.
+- Consultar eventos.
+- Exportar informes.
+- Crear y restaurar copias de seguridad.
+- Configurar cámara y requisitos EPP.
+- Comprobar estado de los modelos.
+Detector facial
+- Cámara en vivo.
+- Reconocimiento mediante YuNet y SFace.
+- Nombre y similitud.
+- Sin análisis EPP.
+- Manteniendo los mismos umbrales y precisión actuales.
+Detector facial + EPP
+- Reconocimiento facial.
+- Seguimiento de cada persona.
+- Casco, chaleco y guantes individualmente.
+- Asociación identidad–track–EPP.
+- Resultado completo o incompleto.
+- Registro final por persona.
+Una única base de datos
+La aplicación final tendría una sola base sistema.sqlite3, pero correctamente dividida en tablas:
+people
+face_templates
+sessions
+epp_events
+system_events
+settings
+Ejemplo conceptual de epp_events:
+id
+timestamp
+person_id
+session_id
+helmet_status
+vest_status
+gloves_status
+overall_status
+camera
+model_version
+No se guardaría únicamente INCOMPLETO. Se conservaría el detalle:
+Felipe
+Casco: sí
+Chaleco: sí
+Guantes: no
+Estado: incompleto
+Tampoco deberíamos guardar una fila por frame. Se registraría una evaluación cuando:
+- La decisión esté confirmada.
+- Cambie un elemento.
+- Termine la inspección.
+- La persona abandone el área.
+Migración de personas actuales
+La base facial actual no debería modificarse. Se haría una copia inicial:
+data/people.sqlite3
+        ↓
+sistema_final/data/sistema.sqlite3
+Luego se ejecutaría una migración para conservar:
+- Nombres.
+- Ocho plantillas faciales.
+- Identificador del modelo SFace.
+- Compatibilidad con el reconocimiento actual.
+Así no sería necesario volver a enrolar a las personas existentes. El prototipo conservaría su base original como respaldo.
+Interfaz premium
+Para modernizarla utilizaría una interfaz oscura y limpia:
+┌──────────────┬───────────────────────────────────────┐
+│ SISTEMA      │                                       │
+│              │              Cámara                   │
+│ Inicio       │                                       │
+│ Facial       │                                       │
+│ Facial + EPP ├───────────────────────┬───────────────┤
+│ Personas     │ Felipe                │ Estado        │
+│ Eventos      │ Similitud facial      │ EPP completo  │
+│ Ajustes      │ Casco / Chaleco / ... │ Cámara activa │
+└──────────────┴───────────────────────┴───────────────┘
+Características visuales:
+- Menú lateral.
+- Tema oscuro.
+- Tarjetas de estado.
+- Indicadores verde, rojo, amarillo y gris.
+- Video grande sin cajas innecesarias.
+- Panel por persona.
+- Tipografía consistente.
+- Botones claros y modernos.
+- Estados de cámara y modelos.
+- Diálogos de confirmación.
+- Mensajes de error comprensibles.
+- Diseño preparado para distintas resoluciones.
+Podemos utilizar CustomTkinter para obtener un acabado moderno sin convertir el proyecto en una aplicación web.
+Una sola cámara compartida
+Los modos nunca deben abrir la cámara desde varios módulos simultáneamente:
+Captura única
+ ├── modo facial → YuNet + SFace
+ └── modo combinado
+      ├── YuNet + SFace
+      └── YOLO + ByteTrack
+Al cambiar de modo, el controlador inicia o detiene los trabajadores necesarios. Esto evita conflictos, retraso acumulado y consumo innecesario de CPU.
+Desarrollo seguro por etapas
+El orden que recomiendo es:
+1. Crear sistema_final/ sin modificar los prototipos.
+2. Construir el menú principal y navegación moderna.
+3. Copiar y adaptar el detector facial conservando su comportamiento.
+4. Implementar Administración y enrolamiento.
+5. Diseñar la nueva base SQLite y migrar registros.
+6. Convertir el prototipo EPP en un módulo reutilizable.
+7. Añadir el modo combinado.
+8. Asociar rostro, track y EPP.
+9. Añadir eventos detallados.
+10. Incorporar configuración, copias de seguridad y pruebas.
+Así siempre tendrás:
+- Prototipo facial original funcional.
+- Prototipo EPP original funcional.
+- Aplicación final desarrollándose por separado.
+- Base original protegida.
+- Posibilidad de comparar resultados y volver atrás.
+Es una arquitectura adecuada para convertir lo que ya funciona en un producto serio, sin arriesgar las versiones actuales.

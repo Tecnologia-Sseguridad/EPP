@@ -1,0 +1,15 @@
+{
+  "camera": "0",
+  "backend": "dshow",
+  "width": 640,
+  "height": 480,
+  "fps": 30,
+  "facial_threshold": 0.45,
+  "facial_margin": 0.08,
+  "facial_hz": 10,
+  "anti_spoofing_enabled": true,
+  "liveness_real_threshold": 0.70,
+  "liveness_fake_threshold": 0.20,
+  "epp_confidence": 0.28,
+  "epp_iou": 0.45
+}

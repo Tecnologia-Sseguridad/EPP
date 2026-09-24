@@ -1,0 +1,7 @@
+venv/
+.venv/
+__pycache__/
+data/
+models/*.onnx
+models/*.part
+*.log

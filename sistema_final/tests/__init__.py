@@ -1,0 +1,1 @@
+"""Pruebas del sistema integrado."""
